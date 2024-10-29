@@ -1,0 +1,70 @@
+{
+  "name": "codemonkey",
+  "displayName": "CodeMonkey",
+  "description": "AI-powered coding assistant",
+  "version": "0.1.0",
+  "engines": {
+      "vscode": "^1.85.0"
+  },
+  "categories": [
+      "Other"
+  ],
+  "activationEvents": [
+
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+      "commands": [
+          {
+              "command": "codemonkey.changeActiveProject",
+              "title": "Change Active Project"
+          }
+      ],
+      "views": {
+          "codemonkey": [
+              {
+                  "type": "webview",
+                  "id": "codemonkey-chat-view",
+                  "name": "Chat",
+                  "icon": "resources/monkey.svg",
+                  "contextualTitle": "CodeMonkey Chat"
+              }
+          ]
+      },
+      "viewsContainers": {
+          "activitybar": [
+              {
+                  "id": "codemonkey",
+                  "title": "CodeMonkey",
+                  "icon": "resources/monkey.svg"
+              }
+          ]
+      }
+  },
+  "scripts": {
+      "vscode:prepublish": "npm run compile",
+      "compile": "tsc -p ./",
+      "watch": "tsc -watch -p ./",
+      "pretest": "npm run compile && npm run lint",
+      "lint": "eslint src --ext ts",
+      "test": "node ./out/test/runTest.js"
+  },
+  "devDependencies": {
+      "@types/glob": "^8.1.0",
+      "@types/mocha": "^10.0.6",
+      "@types/node": "18.x",
+      "@types/vscode": "^1.85.0",
+      "@types/winston": "^2.4.4",
+      "@typescript-eslint/eslint-plugin": "^6.15.0",
+      "@typescript-eslint/parser": "^6.15.0",
+      "eslint": "^8.56.0",
+      "glob": "^10.3.10",
+      "mocha": "^10.2.0",
+      "typescript": "^5.3.3"
+  },
+  "dependencies": {
+      "@anthropic-ai/sdk": "^0.18.0",
+      "dotenv": "^16.4.5",
+      "winston": "^3.11.0"
+  }
+}
