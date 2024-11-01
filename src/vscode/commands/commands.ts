@@ -17,6 +17,11 @@ interface ProjectConfig {
     path: string;
 }
 
+export interface CommandResult {
+    output: string;
+    error?: string;
+}
+
 export function registerCommands(context: vscode.ExtensionContext) {
     const outputChannel = vscode.window.createOutputChannel('CodeMonkey');
     const claudeService = new ClaudeService();

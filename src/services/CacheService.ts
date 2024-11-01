@@ -1,71 +1,117 @@
-import * as fs from 'fs/promises';
+// src/services/CacheService.ts
+
 import * as path from 'path';
+import * as fs from 'fs/promises';
 import * as crypto from 'crypto';
 import * as os from 'os';
 import { logger } from '../utils/logger';
+import { ModelService } from './ModelService';
+import { computeStringSimilarity } from '../utils/similarity';
 
-export interface CacheLevel {
-    level: number;  // 0 = raw, 1 = structured, 2 = summary, 3 = meta-summary
+
+export interface CacheEntry {
+    id: string;
+    level: number;
     content: string;
-    parentHash?: string;
     tags: string[];
-    timestamp: number;
+    parentId?: string;
+    metadata: {
+        timestamp: number;
+        tokensUsed?: number;
+        model?: string;
+        cost?: number;
+    };
 }
 
-export interface CacheIndex {
-    [tag: string]: string[];
+export interface CacheSearchResult {
+    entry: CacheEntry;
+    similarity: number;
 }
 
-export class HierarchicalCacheService {
-    private readonly basePath: string;
-    private readonly levels = ['raw', 'structured', 'summary', 'meta'] as const;
-    
-    constructor() {
-        this.basePath = path.join(os.homedir(), '.codemonkey', 'cache');
-        this.ensureDirectories().catch(error => {
-            logger.error('Failed to create cache directories:', error);
+export class CacheService {
+    private static instance: CacheService;
+    private cacheDir: string;
+    private modelService: ModelService;
+
+    private constructor() {
+        this.cacheDir = path.join(os.homedir(), '.codemonkey', 'cache');
+        this.modelService = ModelService.getInstance();
+        this.initializeCache().catch(error => {
+            logger.error('Failed to initialize cache:', error);
         });
     }
 
-    private async ensureDirectories(): Promise<void> {
-        for (const level of this.levels) {
-            const levelPath = path.join(this.basePath, level);
-            await fs.mkdir(levelPath, { recursive: true });
+    static getInstance(): CacheService {
+        if (!CacheService.instance) {
+            CacheService.instance = CacheService.getInstance();
+        }
+        return CacheService.instance;
+    }
+
+    private async initializeCache(): Promise<void> {
+        try {
+            await fs.mkdir(this.cacheDir, { recursive: true });
+            for (let level = 0; level <= 3; level++) {
+                await fs.mkdir(this.getLevelPath(level), { recursive: true });
+            }
+        } catch (error) {
+            logger.error('Failed to create cache directories:', error);
+            throw error;
         }
     }
 
-    private generateHash(content: string): string {
-        return crypto.createHash('sha256').update(content).digest('hex').substring(0, 12);
+    private getLevelPath(level: number): string {
+        return path.join(this.cacheDir, `level${level}`);
     }
 
-    async store(level: number, content: string, tags: string[], parentHash?: string): Promise<string> {
-        await this.ensureDirectories();
-        
-        const entry: CacheLevel = {
-            level,
-            content,
-            tags,
-            parentHash,
-            timestamp: Date.now()
-        };
-
-        const hash = this.generateHash(content);
-        const levelDir = path.join(this.basePath, this.levels[level]);
-        const filePath = path.join(levelDir, `${hash}.json`);
-
-        await fs.writeFile(filePath, JSON.stringify(entry, null, 2));
-        await this.updateIndex(level, hash, tags);
-
-        return hash;
+    private generateId(content: string): string {
+        return crypto.createHash('sha256')
+            .update(content)
+            .digest('hex')
+            .substring(0, 12);
     }
 
-    private async updateIndex(level: number, hash: string, tags: string[]): Promise<void> {
-        const indexPath = path.join(this.basePath, this.levels[level], 'index.json');
-        let index: CacheIndex = {};
+    async store(
+        level: number,
+        content: string,
+        tags: string[],
+        parentId?: string,
+        tokensUsed?: number
+    ): Promise<CacheEntry> {
+        try {
+            const entry: CacheEntry = {
+                id: this.generateId(content),
+                level,
+                content,
+                tags,
+                parentId,
+                metadata: {
+                    timestamp: Date.now(),
+                    tokensUsed,
+                    model: this.modelService.getCurrentModel(),
+                    cost: tokensUsed ? tokensUsed * this.modelService.getCurrentTokenCost() : undefined
+                }
+            };
+
+            const filePath = path.join(this.getLevelPath(level), `${entry.id}.json`);
+            await fs.writeFile(filePath, JSON.stringify(entry, null, 2));
+            await this.updateIndex(level, entry.id, tags);
+            
+            logger.info(`Cached entry ${entry.id} at level ${level}`);
+            return entry;
+        } catch (error) {
+            logger.error('Failed to store cache entry:', error);
+            throw error;
+        }
+    }
+
+    private async updateIndex(level: number, id: string, tags: string[]): Promise<void> {
+        const indexPath = path.join(this.getLevelPath(level), 'index.json');
+        let index: Record<string, string[]> = {};
         
         try {
             const indexContent = await fs.readFile(indexPath, 'utf-8');
-            index = JSON.parse(indexContent) as CacheIndex;
+            index = JSON.parse(indexContent);
         } catch (error) {
             // Index doesn't exist yet, use empty object
         }
@@ -74,122 +120,167 @@ export class HierarchicalCacheService {
             if (!index[tag]) {
                 index[tag] = [];
             }
-            if (!index[tag].includes(hash)) {
-                index[tag].push(hash);
+            if (!index[tag].includes(id)) {
+                index[tag].push(id);
             }
         }
 
         await fs.writeFile(indexPath, JSON.stringify(index, null, 2));
     }
 
-    async findByTags(tags: string[], level: number): Promise<CacheLevel[]> {
-        const indexPath = path.join(this.basePath, this.levels[level], 'index.json');
-        let matchingHashes: string[] = [];
-        
+    async get(id: string, level: number): Promise<CacheEntry | null> {
         try {
-            const indexContent = await fs.readFile(indexPath, 'utf-8');
-            const index = JSON.parse(indexContent) as CacheIndex;
-            
-            // Find entries that match ALL provided tags
-            const hashSets = tags.map(tag => new Set<string>(index[tag] || []));
-            matchingHashes = Array.from(hashSets[0] || new Set<string>()).filter(hash => 
-                hashSets.every(set => set.has(hash))
-            );
+            const filePath = path.join(this.getLevelPath(level), `${id}.json`);
+            const content = await fs.readFile(filePath, 'utf-8');
+            return JSON.parse(content) as CacheEntry;
         } catch (error) {
-            return [];
+            logger.debug(`Cache miss for ${id} at level ${level}`);
+            return null;
         }
-
-        const results: CacheLevel[] = [];
-        for (const hash of matchingHashes) {
-            try {
-                const content = await fs.readFile(
-                    path.join(this.basePath, this.levels[level], `${hash}.json`),
-                    'utf-8'
-                );
-                results.push(JSON.parse(content) as CacheLevel);
-            } catch (error) {
-                logger.error(`Failed to read cache entry ${hash}:`, error);
-            }
-        }
-
-        return results;
     }
 
-    async getRelatedContent(hash: string): Promise<CacheLevel[]> {
-        const results: CacheLevel[] = [];
-        
-        for (const level of this.levels) {
-            try {
-                const content = await fs.readFile(
-                    path.join(this.basePath, level, `${hash}.json`),
-                    'utf-8'
-                );
-                const entry = JSON.parse(content) as CacheLevel;
-                results.push(entry);
-                
-                // Get children if they exist
-                const childEntries = await this.findByTags([hash], this.levels.indexOf(level) + 1);
-                results.push(...childEntries);
-            } catch (error) {
-                // Entry doesn't exist at this level
-            }
-        }
+    async search(
+        query: string,
+        level: number,
+        tags?: string[],
+        similarityThreshold: number = 0.8
+    ): Promise<CacheSearchResult[]> {
+        try {
+            const levelPath = this.getLevelPath(level);
+            const files = await fs.readdir(levelPath);
+            const results: CacheSearchResult[] = [];
 
-        return results;
+            for (const file of files) {
+                if (!file.endsWith('.json') || file === 'index.json') continue;
+
+                const entry = await this.get(file.replace('.json', ''), level);
+                if (!entry) continue;
+
+                // Check tags first if provided
+                if (tags && !tags.every(tag => entry.tags.includes(tag))) {
+                    continue;
+                }
+
+                const similarity = computeStringSimilarity(query, entry.content);
+                if (similarity >= similarityThreshold) {
+                    results.push({ entry, similarity });
+                }
+            }
+
+            return results.sort((a, b) => b.similarity - a.similarity);
+        } catch (error) {
+            logger.error('Failed to search cache:', error);
+            return [];
+        }
+    }
+
+    async getHierarchy(id: string, level: number): Promise<CacheEntry[]> {
+        const results: CacheEntry[] = [];
+        try {
+            // Get the requested entry
+            const entry = await this.get(id, level);
+            if (!entry) return results;
+
+            results.push(entry);
+
+            // Get parent entries
+            let currentEntry = entry;
+            while (currentEntry.parentId) {
+                const parent = await this.get(currentEntry.parentId, currentEntry.level - 1);
+                if (!parent) break;
+                results.unshift(parent);
+                currentEntry = parent;
+            }
+
+            // Get child entries
+            const children = await this.findChildren(id, level + 1);
+            results.push(...children);
+
+            return results;
+        } catch (error) {
+            logger.error(`Failed to get hierarchy for ${id}:`, error);
+            return results;
+        }
+    }
+
+    private async findChildren(parentId: string, level: number): Promise<CacheEntry[]> {
+        try {
+            const levelPath = this.getLevelPath(level);
+            const files = await fs.readdir(levelPath);
+            const children: CacheEntry[] = [];
+
+            for (const file of files) {
+                if (!file.endsWith('.json') || file === 'index.json') continue;
+
+                const entry = await this.get(file.replace('.json', ''), level);
+                if (entry && entry.parentId === parentId) {
+                    children.push(entry);
+                }
+            }
+
+            return children;
+        } catch (error) {
+            logger.error(`Failed to find children for ${parentId}:`, error);
+            return [];
+        }
     }
 
     async cleanup(maxAge: number = 7 * 24 * 60 * 60 * 1000): Promise<void> {
-        const now = Date.now();
-        
-        for (let i = 0; i < this.levels.length; i++) {
-            const level = this.levels[i];
-            const levelPath = path.join(this.basePath, level);
-            try {
+        try {
+            const now = Date.now();
+
+            for (let level = 0; level <= 3; level++) {
+                const levelPath = this.getLevelPath(level);
                 const files = await fs.readdir(levelPath);
-                
+
                 for (const file of files) {
-                    if (file === 'index.json') continue;
-                    
-                    const filePath = path.join(levelPath, file);
-                    try {
-                        const content = await fs.readFile(filePath, 'utf-8');
-                        const entry = JSON.parse(content) as CacheLevel;
-                        
-                        if (now - entry.timestamp > maxAge) {
-                            await fs.unlink(filePath);
-                            logger.info(`Cleaned up old cache entry: ${file}`);
-                        }
-                    } catch (error) {
-                        logger.error(`Failed to process cache file ${file}:`, error);
+                    if (!file.endsWith('.json') || file === 'index.json') continue;
+
+                    const entry = await this.get(file.replace('.json', ''), level);
+                    if (!entry) continue;
+
+                    if (now - entry.metadata.timestamp > maxAge) {
+                        await this.invalidate(entry.id, level);
                     }
                 }
-                
-                await this.rebuildIndex(i);
-            } catch (error) {
-                logger.error(`Failed to clean up cache level ${level}:`, error);
+
+                await this.rebuildIndex(level);
             }
+
+            logger.info('Cache cleanup completed');
+        } catch (error) {
+            logger.error('Failed to cleanup cache:', error);
+        }
+    }
+
+    async invalidate(id: string, level: number): Promise<void> {
+        try {
+            const filePath = path.join(this.getLevelPath(level), `${id}.json`);
+            await fs.unlink(filePath);
+            logger.info(`Invalidated cache entry ${id} at level ${level}`);
+        } catch (error) {
+            logger.error(`Failed to invalidate cache entry ${id}:`, error);
         }
     }
 
     private async rebuildIndex(level: number): Promise<void> {
-        const levelPath = path.join(this.basePath, this.levels[level]);
+        const levelPath = this.getLevelPath(level);
         const files = await fs.readdir(levelPath);
-        const index: CacheIndex = {};
+        const index: Record<string, string[]> = {};
         
         for (const file of files) {
-            if (file === 'index.json') continue;
+            if (!file.endsWith('.json') || file === 'index.json') continue;
             
             try {
-                const content = await fs.readFile(path.join(levelPath, file), 'utf-8');
-                const entry = JSON.parse(content) as CacheLevel;
-                const hash = file.replace('.json', '');
-                
-                for (const tag of entry.tags) {
-                    if (!index[tag]) {
-                        index[tag] = [];
-                    }
-                    if (!index[tag].includes(hash)) {
-                        index[tag].push(hash);
+                const entry = await this.get(file.replace('.json', ''), level);
+                if (entry) {
+                    for (const tag of entry.tags) {
+                        if (!index[tag]) {
+                            index[tag] = [];
+                        }
+                        if (!index[tag].includes(entry.id)) {
+                            index[tag].push(entry.id);
+                        }
                     }
                 }
             } catch (error) {
@@ -203,3 +294,7 @@ export class HierarchicalCacheService {
         );
     }
 }
+
+// Export the class as default and named
+export default CacheService;
+export { CacheService as HierarchicalCacheService };

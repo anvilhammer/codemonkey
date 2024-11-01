@@ -1,250 +1,145 @@
+// src/services/ClaudeService.ts
+
 import Anthropic from '@anthropic-ai/sdk';
-import { Message } from '../vscode/types/chat';
-import { logger } from '../utils/logger';
-import { ModelService } from './ModelService';
-import { HierarchicalCacheService } from './CacheService';
-import { ContextManager } from './ContextManager';
-import { ModelType } from './ModelService';
-import { SYSTEM_PROMPT } from './SystemPrompts';
 import * as dotenv from 'dotenv';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { logger } from '../utils/logger';
+import { Message, Role } from '../vscode/types/chat';
+import { SYSTEM_PROMPT } from './SystemPrompts';
+import { WorkspaceService } from './WorkspaceService';
+import { CacheService } from './CacheService';
+import { ModelService } from './ModelService';
+import { ModelType } from './ModelService';
 
+// Get the absolute path to .env from the extension root
 const envPath = path.join(__dirname, '..', '..', '.env');
 dotenv.config({ path: envPath });
 
+if (!process.env.CLAUDE_API_KEY) {
+    throw new Error(`CLAUDE_API_KEY is not set in environment variables. Looking for .env at: ${envPath}`);
+}
+
+export interface ClaudeServiceConfig {
+    apiKey?: string;
+    maxContextMessages?: number;
+    contextWindowSize?: number;
+    outputChannel?: vscode.OutputChannel;
+}
 
 export class ClaudeService {
-    private readonly client: Anthropic;
-    private readonly modelService: ModelService;
-    private readonly cacheService: HierarchicalCacheService;
-    private readonly contextManager: ContextManager;
+    private client: Anthropic;
+    private workspaceService: WorkspaceService;
+    private modelService: ModelService;
+    private cacheService: CacheService;
+    private readonly outputChannel: vscode.OutputChannel;
 
-    constructor() {
-        logger.info('API Key status:', process.env.CLAUDE_API_KEY ? 'Found' : 'Not found');
-        logger.info('Looking for .env at:', envPath);
-        
-        if (!process.env.CLAUDE_API_KEY) {
-            throw new Error(`CLAUDE_API_KEY is not set in environment variables. Looking for .env at: ${envPath}`);
-        }
+    constructor(config?: ClaudeServiceConfig) {
         this.client = new Anthropic({
-            apiKey: process.env.CLAUDE_API_KEY
+            apiKey: config?.apiKey || process.env.CLAUDE_API_KEY
         });
+        this.outputChannel = config?.outputChannel || vscode.window.createOutputChannel('CodeMonkey');
+        this.workspaceService = new WorkspaceService(this.outputChannel);
+        this.cacheService = CacheService.getInstance();
         this.modelService = ModelService.getInstance();
-        this.modelService.setModel('haiku');
-        this.cacheService = new HierarchicalCacheService();
-        this.contextManager = ContextManager.getInstance();
     }
 
-      // Make sure setModel persists the change
-        setModel(modelType: ModelType): void {
-        this.modelService.setModel(modelType);
-        logger.info(`Model changed to ${modelType}`);
+    private async prepareContext(history: Message[]): Promise<Message[]> {
+        if (!history || history.length === 0) {
+            return [];
+        }
+
+        return history;
     }
 
-        private async structureContent(rawContent: string, tags: string[]): Promise<void> {
+    private async getWorkspaceContext(): Promise<string> {
         try {
-            // Store raw content (Level 0)
-            const rawId = await this.cacheService.store(
-                0,
-                rawContent,
-                tags
-            );
+            const workspaceInfo = await this.workspaceService.getWorkspaceContent(true);
+            if (!workspaceInfo) {
+                return 'No workspace context available.';
+            }
 
-            // Parse and structure the content
-            const structured = {
-                codeBlocks: this.extractCodeBlocks(rawContent),
-                systemCommands: this.extractSystemCommands(rawContent),
-                explanations: this.extractExplanations(rawContent),
-                suggestions: this.extractSuggestions(rawContent),
-                timestamp: Date.now()
-            };
-
-            // Store structured version (Level 1)
-            await this.cacheService.store(
-                1,
-                JSON.stringify(structured, null, 2),
-                [...tags, 'structured'],
-                rawId  // Link to raw content
-            );
-
-            logger.info('Content structured and cached at levels 0 and 1');
+            const context = `Current workspace: ${workspaceInfo.path}\n`;
+            return context;
         } catch (error) {
-            logger.error('Failed to structure content:', error);
+            logger.error('Failed to get workspace context:', error);
+            return 'Failed to get workspace context.';
         }
     }
 
-    private extractCodeBlocks(content: string): string[] {
-        const codeBlockRegex = /```[\s\S]*?```/g;
-        return content.match(codeBlockRegex) || [];
-    }
-
-    private extractSystemCommands(content: string): string[] {
-        const commandRegex = /<systemCommand>([\s\S]*?)<\/systemCommand>/g;
-        const matches = [];
-        let match;
-        while ((match = commandRegex.exec(content)) !== null) {
-            matches.push(match[1]);
-        }
-        return matches;
-    }
-
-    private extractExplanations(content: string): string[] {
-        // Extract content not in code blocks or commands
-        const cleanContent = content
-            .replace(/```[\s\S]*?```/g, '')
-            .replace(/<systemCommand>[\s\S]*?<\/systemCommand>/g, '');
-        
-        return cleanContent
-            .split('\n\n')
-            .map(p => p.trim())
-            .filter(p => p.length > 0);
-    }
-
-    private extractSuggestions(content: string): string[] {
-        const suggestions = [];
-        const lines = content.split('\n');
-        for (let i = 0; i < lines.length; i++) {
-            if (lines[i].match(/\b(suggest|recommend|could|should|might)\b/i)) {
-                suggestions.push(lines[i].trim());
-            }
-        }
-        return suggestions;
-    }
-    
-    async sendMessage(message: string, history: Message[]): Promise<string> {
-        try {
-            logger.info('Preparing to send message to Claude API');
-
-            // Check cache first
-            const cacheResults = await this.cacheService.findByTags(
-                ['message', ...this.extractTags(message)],
-                0 // Raw level
-            );
-
-            if (cacheResults.length > 0) {
-                logger.info('Cache hit, returning cached response');
-                return cacheResults[0].content;
-            }
-
-            // Analyze task complexity
-            const complexity = this.analyzeComplexity(message);
-            const currentModel = this.modelService.getCurrentModel();
-            let suggestedModel: ModelType = 'haiku';
-            let useModelForMessage: ModelType = currentModel;  // The model we'll actually use
-            
-            if (complexity >= 0.8) {
-                suggestedModel = 'opus';
-            } else if (complexity >= 0.5) {
-                suggestedModel = 'sonnet';
-            }
-
-            if (suggestedModel !== currentModel) {
-                const response = await vscode.window.showInformationMessage(
-                    `This task's complexity is better served by ${suggestedModel}. Would you like to send this message to ${suggestedModel} or keep using ${currentModel}?`,
-                    { modal: true },
-                    suggestedModel,  // First button - recommended option
-                    currentModel     // Second button - keep current
-                );
-                
-                // Use suggested model just for this message if selected
-                useModelForMessage = response || currentModel;
-                logger.info(`Using ${useModelForMessage} for this message (default model remains ${currentModel})`);
-            }
-
-            // Store original model and set temporary one for this message
-            const originalModel = this.modelService.getCurrentModel();
-            this.modelService.setModel(useModelForMessage);
-
-            // Optimize context
-            const contextWindow = await this.contextManager.optimizeContext(
-                history,
-                4000
-            );
-
-            // Clean messages for API by only including role and content
-            const cleanMessages = contextWindow.messages.map(({ role, content }) => ({
-                role,
-                content
+    private convertToAnthropicMessages(messages: Message[]): { role: Role; content: string }[] {
+        return messages
+            .filter(msg => msg.role !== 'system')
+            .map(msg => ({
+                role: msg.role as Role,
+                content: msg.content
             }));
+    }
 
+    async sendMessage(message: string, history: Message[] = []): Promise<string> {
+        try {
+            logger.info('Preparing context for Claude API');
+            
+            if (!message) {
+                throw new Error('Message cannot be empty');
+            }
+            
+            // Try to find similar cached responses
+            const similarResponses = await this.cacheService.search(
+                message,
+                2,  // Use level 2 for responses
+                ['chat_response'],
+                0.9
+            );
+
+            if (similarResponses.length > 0) {
+                logger.info('Found cached similar response');
+                return similarResponses[0].entry.content;
+            }
+            
+            const workspaceContext = await this.getWorkspaceContext();
+            const optimizedHistory = await this.prepareContext(history);
+            const contextualizedMessage = `${workspaceContext}\n\nUser Message: ${message}`;
+            
             const response = await this.client.messages.create({
                 model: this.modelService.getModelString(),
                 max_tokens: 4000,
                 messages: [
-                    ...cleanMessages,
-                    { role: 'user', content: message }
+                    ...this.convertToAnthropicMessages(optimizedHistory),
+                    { role: 'user' as Role, content: contextualizedMessage }
                 ],
                 system: SYSTEM_PROMPT
             });
 
-            const responseContent = response.content[0].text;
+            if (!response?.content?.[0]?.text) {
+                throw new Error('Invalid response from Claude API');
+            }
 
-            // Structure and store the content in cache hierarchy
-            const tags = this.extractTags(message);
-            await this.structureContent(responseContent, tags);
+            // Cache the response
+            await this.cacheService.store(
+                2,  // Use level 2 for responses
+                response.content[0].text,
+                ['chat_response', 'workspace_context'],
+                undefined,  // No parent ID
+                response.usage?.output_tokens
+            );
 
-            // Log token usage
-            logger.info('Token usage:', {
-                prompt: response.usage?.input_tokens || 0,
-                completion: response.usage?.output_tokens || 0,
-                total: (response.usage?.input_tokens || 0) + (response.usage?.output_tokens || 0)
-            });
-
-            // Restore original model
-            this.modelService.setModel(originalModel);
-            logger.info(`Restored model to ${originalModel}`);
-
-            return responseContent;
+            logger.info(`Used model: ${this.modelService.getCurrentModel()}`);
+            return response.content[0].text;
 
         } catch (error) {
-            logger.error('Error in Claude service:', error);
+            logger.error('Error calling Claude API:', error);
             throw error;
         }
     }
 
-       private analyzeComplexity(message: string): number {
-        const complexityIndicators = {
-            code: /(function|class|import|export|async|await)/g,
-            systemCommands: /<systemCommand>/g,
-            fileOperations: /(CREATE_FILE|WRITE_TO_FILE|READ_FILE|DELETE_FILE)/g,
-            architecture: /(architecture|design pattern|database schema|api|authentication)/gi
-        };
-
-        let complexityScore = 0;
-        const messageLength = message.length;
-
-        // Length-based complexity (0.1 - 0.3)
-        complexityScore += Math.min(0.3, messageLength / 1000);
-
-        // Feature-based complexity (0.0 - 0.7)
-        Object.values(complexityIndicators).forEach(pattern => {
-            const matches = (message.match(pattern) || []).length;
-            complexityScore += matches * 0.1;
-        });
-
-        return Math.min(1, complexityScore);
+    public dispose(): void {
+        this.outputChannel.dispose();
     }
 
-    private extractTags(message: string): string[] {
-        const tags = new Set<string>();
-
-        // Extract technical terms
-        const techTerms = message.match(
-            /\b(?:react|vue|angular|node|api|database|auth|docker|kubernetes|aws|azure|git|ci|cd)\b/gi
-        );
-        if (techTerms) {
-            techTerms.forEach(term => tags.add(term.toLowerCase()));
-        }
-
-        // Extract action types
-        const actions = message.match(
-            /\b(?:create|update|delete|read|install|deploy|configure|debug|test|optimize)\b/gi
-        );
-        if (actions) {
-            actions.forEach(action => tags.add(action.toLowerCase()));
-        }
-
-        return Array.from(tags);
+    public setModel(modelId: string): void {
+        this.modelService.setModel(modelId as ModelType);
     }
 }
+
+export default ClaudeService;

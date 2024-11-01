@@ -1,8 +1,8 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import { spawn } from 'child_process';
 import { logger } from '../utils/logger';
+import { CommandResult } from '../vscode/commands/commands';
 
 export interface WorkspaceInfo {
     path: string;
@@ -11,85 +11,76 @@ export interface WorkspaceInfo {
     fileContents?: { [path: string]: string };
 }
 
-interface CommandResult {
-    success: boolean;
-    output: string;
-    error?: string;
-    workspaceChanges?: WorkspaceInfo;
+interface FileOperationTransaction {
+    operations: Array<
+        | { type: 'CREATE_FILE'; filePath: string; content: string }
+        | { type: 'UPDATE_FILE'; filePath: string; content: string }
+        | { type: 'DELETE_FILE'; filePath: string }
+    >;
+    workspaceInfo: WorkspaceInfo;
 }
 
 export class WorkspaceService {
     private readonly outputChannel: vscode.OutputChannel;
+    private cachedWorkspaceInfo: WorkspaceInfo | null = null;
 
     constructor(outputChannel?: vscode.OutputChannel) {
         this.outputChannel = outputChannel || vscode.window.createOutputChannel('CodeMonkey Shell');
     }
 
-    async executeCommand(command: string): Promise<CommandResult> {
-        return new Promise((resolve) => {
-            // Show and clear output channel
-            this.outputChannel.show(true);
-            this.outputChannel.appendLine(`\n\x1b[36m> Executing: ${command}\x1b[0m`);  // Cyan color for commands
+    async createWorkspaceSnapshot(): Promise<void> {
+        this.cachedWorkspaceInfo = await this.getWorkspaceContent(true);
+    }
 
-            let outputBuffer = '';
-            let errorBuffer = '';
+    async getWorkspaceInfo(): Promise<WorkspaceInfo> {
+        if (this.cachedWorkspaceInfo) {
+            return this.cachedWorkspaceInfo;
+        }
+        return this.getWorkspaceContent(true);
+    }
 
-            const process = spawn(command, [], {
-                shell: true,
-                cwd: this.resolveWorkspacePath('.'),
-            });
+    async beginTransaction(): Promise<FileOperationTransaction> {
+        return {
+            operations: [],
+            workspaceInfo: await this.getWorkspaceInfo()
+        };
+    }
 
-            process.stdout.on('data', (data) => {
-                const output = data.toString();
-                outputBuffer += output;
-                // Green color for standard output
-                this.outputChannel.append(`\x1b[32m${output}\x1b[0m`);
-                logger.info(`Command output: ${output.trim()}`);
-            });
-
-            process.stderr.on('data', (data) => {
-                const error = data.toString();
-                errorBuffer += error;
-                // Red color for errors
-                this.outputChannel.append(`\x1b[31m${error}\x1b[0m`);
-                logger.error(`Command error: ${error.trim()}`);
-            });
-
-            process.on('close', async (code) => {
-                const result: CommandResult = {
-                    success: code === 0,
-                    output: outputBuffer,
-                    workspaceChanges: await this.getWorkspaceContent()
-                };
-
-                if (code !== 0) {
-                    result.error = errorBuffer;
-                    this.outputChannel.appendLine(`\x1b[31m✖ Command failed with exit code ${code}\x1b[0m`);
-                } else {
-                    this.outputChannel.appendLine(`\x1b[32m✔ Command completed successfully\x1b[0m`);
+    async commitTransaction(transaction: FileOperationTransaction): Promise<void> {
+        try {
+            for (const operation of transaction.operations) {
+                switch (operation.type) {
+                    case 'CREATE_FILE':
+                        await this.createFile(operation.filePath, operation.content);
+                        break;
+                    case 'UPDATE_FILE':
+                        await this.updateFile(operation.filePath, operation.content);
+                        break;
+                    case 'DELETE_FILE':
+                        await this.deleteFile(operation.filePath);
+                        break;
                 }
+            }
+            this.cachedWorkspaceInfo = transaction.workspaceInfo;
+        } catch (error) {
+            await this.rollbackTransaction(transaction);
+            throw error;
+        }
+    }
 
-                // Show workspace changes
-                if (result.workspaceChanges) {
-                    this.outputChannel.appendLine('\n\x1b[36mWorkspace changes:\x1b[0m');
-                    this.outputChannel.appendLine(`Files: ${result.workspaceChanges.files.join(', ')}`);
-                    this.outputChannel.appendLine(`Directories: ${result.workspaceChanges.directories.join(', ')}`);
-                }
-
-                resolve(result);
-            });
-
-            process.on('error', (error) => {
-                const result: CommandResult = {
-                    success: false,
-                    output: outputBuffer,
-                    error: error.message
-                };
-                this.outputChannel.appendLine(`\x1b[31m✖ Failed to execute command: ${error.message}\x1b[0m`);
-                logger.error('Command execution error:', error);
-                resolve(result);
-            });
-        });
+    async rollbackTransaction(transaction: FileOperationTransaction): Promise<void> {
+        for (const operation of transaction.operations.reverse()) {
+            switch (operation.type) {
+                case 'CREATE_FILE':
+                case 'UPDATE_FILE':
+                    await this.deleteFile(operation.filePath);
+                    break;
+                case 'DELETE_FILE':
+                    await this.createFile(operation.filePath, transaction.workspaceInfo.fileContents?.[operation.filePath] || '');
+                    break;
+            }
+        }
+        this.cachedWorkspaceInfo = transaction.workspaceInfo;
     }
 
     async createFile(filePath: string, content: string): Promise<void> {
@@ -102,19 +93,6 @@ export class WorkspaceService {
         } catch (error) {
             this.outputChannel.appendLine(`\x1b[31m✖ Failed to create file ${filePath}: ${error}\x1b[0m`);
             logger.error(`Failed to create file ${filePath}:`, error);
-            throw error;
-        }
-    }
-
-    async readFile(filePath: string): Promise<string> {
-        try {
-            const fullPath = this.resolveWorkspacePath(filePath);
-            const content = await fs.readFile(fullPath, 'utf-8');
-            logger.info(`Read file: ${filePath}`);
-            return content;
-        } catch (error) {
-            this.outputChannel.appendLine(`\x1b[31m✖ Failed to read file ${filePath}: ${error}\x1b[0m`);
-            logger.error(`Failed to read file ${filePath}:`, error);
             throw error;
         }
     }
@@ -201,29 +179,40 @@ export class WorkspaceService {
         return path.join(workspaceFolder.uri.fsPath, relativePath);
     }
 
-    async setBreakpoint(filePath: string, line: number): Promise<void> {
-        const uri = vscode.Uri.file(this.resolveWorkspacePath(filePath));
-        const position = new vscode.Position(line - 1, 0);
-        const location = new vscode.Location(uri, position);
-        
-        await vscode.debug.addBreakpoints([
-            new vscode.SourceBreakpoint(location)
-        ]);
-        
-        this.outputChannel.appendLine(`\x1b[32m✔ Set breakpoint at ${filePath}:${line}\x1b[0m`);
-    }
-
-    async installExtension(extensionId: string): Promise<void> {
+    public async readFile(filePath: string): Promise<string> {
         try {
-            await vscode.commands.executeCommand(
-                'workbench.extensions.installExtension',
-                extensionId
-            );
-            this.outputChannel.appendLine(`\x1b[32m✔ Installed extension: ${extensionId}\x1b[0m`);
+            const fullPath = this.resolveWorkspacePath(filePath);
+            const content = await fs.readFile(fullPath, 'utf-8');
+            this.outputChannel.appendLine(`Read file: ${filePath}`);
+            logger.info(`Read file: ${filePath}`);
+            return content;
         } catch (error) {
-            this.outputChannel.appendLine(`\x1b[31m✖ Failed to install extension ${extensionId}: ${error}\x1b[0m`);
-            logger.error(`Failed to install extension ${extensionId}:`, error);
+            logger.error(`Failed to read file ${filePath}:`, error);
             throw error;
         }
+    }
+
+    public async executeCommand(command: string): Promise<CommandResult> {
+        return new Promise((resolve) => {
+            const terminal = vscode.window.createTerminal('CodeMonkey Terminal');
+            this.outputChannel.appendLine(`Executing command: ${command}`);
+            
+            terminal.sendText(command);
+            
+            setTimeout(async () => {
+                try {
+                    terminal.dispose();
+                    const workspaceInfo = await this.getWorkspaceContent();
+                    resolve({
+                        output: `Command executed: ${command}\nCurrent workspace state:\nFiles: ${workspaceInfo.files.join(', ')}\nDirectories: ${workspaceInfo.directories.join(', ')}`
+                    });
+                } catch (error) {
+                    resolve({
+                        output: `Command executed: ${command}`,
+                        error: error instanceof Error ? error.message : String(error)
+                    });
+                }
+            }, 2000);
+        });
     }
 }

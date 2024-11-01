@@ -1,3 +1,5 @@
+// src/vscode/types/chat.ts
+
 export type MessageType = 
     | 'user'
     | 'assistant'
@@ -11,15 +13,20 @@ export type MessageType =
     | 'warning'
     | 'success';
 
+// Keep Role compatible with Anthropic API
 export type Role = 'user' | 'assistant';
 
+// Add internal message role type
+export type InternalRole = Role | 'system';
+
 export interface Message {
-    role: Role;
+    role: InternalRole;  // Use InternalRole here
     content: string;
     type?: MessageType;
     timestamp?: number;
 }
 
+// Rest of the interfaces remain the same
 export interface ChatMessage {
     id: string;
     type: MessageType;

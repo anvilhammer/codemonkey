@@ -1,7 +1,9 @@
+// src/extension.ts
+
 import * as vscode from 'vscode';
 import { ChatProvider } from './vscode/views/ChatProvider';
 import { logger } from './utils/logger';
-import { HierarchicalCacheService } from './services/CacheService';
+import { CacheService } from './services/CacheService';
 
 export async function activate(context: vscode.ExtensionContext) {
     try {
@@ -10,8 +12,8 @@ export async function activate(context: vscode.ExtensionContext) {
         const outputChannel = vscode.window.createOutputChannel('CodeMonkey');
         context.subscriptions.push(outputChannel);
 
-        // Initialize cache service
-        const cacheService = new HierarchicalCacheService();
+        // Initialize cache service using singleton pattern
+        const cacheService = CacheService.getInstance();
         
         // Set up periodic cache cleanup
         const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; // 24 hours
@@ -21,8 +23,8 @@ export async function activate(context: vscode.ExtensionContext) {
             });
         }, CLEANUP_INTERVAL);
 
-        // Register cleanup for disposal
-        context.subscriptions.push({ dispose: () => clearInterval(cleanup) });
+        // Register cleanup for disposal with proper type
+        context.subscriptions.push(new vscode.Disposable(() => clearInterval(cleanup)));
         
         // Initialize chat provider
         const chatProvider = new ChatProvider(context.extensionUri, outputChannel);
@@ -70,5 +72,12 @@ export async function activate(context: vscode.ExtensionContext) {
 }
 
 export function deactivate() {
-    logger.info('CodeMonkey deactivated');
+    // Clean up cache service on deactivation
+    try {
+        const cacheService = CacheService.getInstance();
+        void cacheService.cleanup();
+        logger.info('CodeMonkey deactivated and cache cleaned');
+    } catch (error) {
+        logger.error('Error during CodeMonkey deactivation:', error);
+    }
 }

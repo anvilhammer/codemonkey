@@ -1,3 +1,5 @@
+// src/vscode/views/ChatProvider.ts
+
 import * as vscode from 'vscode';
 import { ChatMessage, MessageType, ApiContext, WebviewMessage } from '../types/chat';
 import { ClaudeService } from '../../services/ClaudeService';
@@ -30,7 +32,7 @@ export class ChatProvider implements vscode.WebviewViewProvider {
         this.workspaceService = new WorkspaceService(_outputChannel);
         this.loadHistory();
     }
-
+    
     private async loadHistory(): Promise<void> {
         const history = await this._historyService.loadHistory();
         this._messageHistory = history.map(entry => ({
@@ -114,13 +116,11 @@ User Message: ${message}`;
                     try {
                         const result = await this.executeCommands([command]);
                         if (result.trim()) {
-                            // Add command result as a separate message with appropriate styling
                             if (result.toLowerCase().includes('error')) {
                                 this._addMessage('error', result);
                             } else {
                                 this._addMessage('systemCommand', result);
                                 if (command.type === 'EXECUTE_COMMAND') {
-                                    // Add success message for executed commands
                                     this._addMessage('success', `Command executed: ${command.params.content}`);
                                 }
                             }
@@ -187,6 +187,7 @@ User Message: ${message}`;
             return 'Unable to get workspace information';
         }
     }
+
     private async executeCommands(commands: Command[]): Promise<string> {
         const results: string[] = [];
         
@@ -221,7 +222,9 @@ User Message: ${message}`;
                     }
                     case 'EXECUTE_COMMAND': {
                         const result = await this.workspaceService.executeCommand(command.params.content as string);
-                        results.push(result.output);
+                        if (result.output) {
+                            results.push(result.output);
+                        }
                         if (result.error) {
                             results.push(`Error: ${result.error}`);
                         }
@@ -238,7 +241,6 @@ User Message: ${message}`;
     }
     
     private async _addMessage(type: MessageType, content: string) {
-        // Clean up any ANSI color codes from terminal output for display
         const cleanContent = content.replace(
             // eslint-disable-next-line no-control-regex
             /\x1b\[[0-9;]*m/g,
@@ -255,11 +257,9 @@ User Message: ${message}`;
         this._messages.push(message);
         this._updateWebview();
         
-        // Use colors in output channel
-        const prefix = type === 'error' ? '\x1b[31m' :  // Red for errors
-                      type === 'success' ? '\x1b[32m' :  // Green for success
-                      type === 'systemCommand' ? '\x1b[36m' : // Cyan for commands
-                      '';
+        const prefix = type === 'error' ? '\x1b[31m' : 
+                      type === 'success' ? '\x1b[32m' : 
+                      type === 'systemCommand' ? '\x1b[36m' : '';
         const suffix = prefix ? '\x1b[0m' : '';
         this._outputChannel.appendLine(`[${type}] ${prefix}${cleanContent}${suffix}`);
         
