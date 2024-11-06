@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import { logger } from '../../utils/logger';
-import { ClaudeService } from '../../services/ClaudeService';
+import { ClaudeService, ClaudeServiceConfig } from '../../services/ClaudeService';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 
@@ -17,20 +17,23 @@ interface ProjectConfig {
     path: string;
 }
 
-export interface CommandResult {
-    output: string;
-    error?: string;
-}
+export function registerCommands(context: vscode.ExtensionContext, outputChannel: vscode.OutputChannel) {
+    // Create config object for ClaudeService
+    const claudeConfig: ClaudeServiceConfig = {
+        outputChannel,
+        maxContextMessages: 10,
+        contextWindowSize: 15000
+    };
 
-export function registerCommands(context: vscode.ExtensionContext) {
-    const outputChannel = vscode.window.createOutputChannel('CodeMonkey');
-    const claudeService = new ClaudeService();
+    const claudeService = new ClaudeService(claudeConfig);
 
     // Register createProject command
     const createProject = vscode.commands.registerCommand('codemonkey.createProject', async (config: ProjectConfig) => {
         try {
+            outputChannel.show(true);
             logger.info(`Creating project: ${config.name} at ${config.path}`);
-            logger.info(`Requirements: ${config.requirements}`);
+            outputChannel.appendLine(`Creating project: ${config.name} at ${config.path}`);
+            outputChannel.appendLine(`Requirements: ${config.requirements}`);
 
             // Create project directory
             if (!fs.existsSync(config.path)) {
@@ -102,7 +105,7 @@ Also include any key files or configurations needed for the project.
         }
     });
 
+    // Add commands to subscriptions
     context.subscriptions.push(changeActiveProject);
     context.subscriptions.push(createProject);
-    context.subscriptions.push(outputChannel);
 }

@@ -1,23 +1,26 @@
 // src/services/ClaudeService.ts
 
 import Anthropic from '@anthropic-ai/sdk';
+import OpenAI from 'openai';
 import * as dotenv from 'dotenv';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { logger } from '../utils/logger';
-import { Message, Role } from '../vscode/types/chat';
+import { Message } from '../vscode/types/chat';
 import { SYSTEM_PROMPT } from './SystemPrompts';
 import { WorkspaceService } from './WorkspaceService';
 import { CacheService } from './CacheService';
-import { ModelService } from './ModelService';
-import { ModelType } from './ModelService';
+import { ModelService, ModelType, MODELS } from './ModelService';
 
-// Get the absolute path to .env from the extension root
+// Load environment variables
 const envPath = path.join(__dirname, '..', '..', '.env');
 dotenv.config({ path: envPath });
 
-if (!process.env.CLAUDE_API_KEY) {
-    throw new Error(`CLAUDE_API_KEY is not set in environment variables. Looking for .env at: ${envPath}`);
+// Check for API keys
+if (!process.env.CLAUDE_API_KEY && !process.env.OPENAI_API_KEY) {
+    throw new Error(
+        `CLAUDE_API_KEY or OPENAI_API_KEY is not set in environment variables. Looking for .env at: ${envPath}`
+    );
 }
 
 export interface ClaudeServiceConfig {
@@ -28,66 +31,60 @@ export interface ClaudeServiceConfig {
 }
 
 export class ClaudeService {
-    private client: Anthropic;
+    private anthropicClient: Anthropic | null = null;
+    private openaiClient: OpenAI | null = null;
     private workspaceService: WorkspaceService;
     private modelService: ModelService;
     private cacheService: CacheService;
     private readonly outputChannel: vscode.OutputChannel;
 
     constructor(config?: ClaudeServiceConfig) {
-        this.client = new Anthropic({
-            apiKey: config?.apiKey || process.env.CLAUDE_API_KEY
-        });
+        // Initialize clients if API keys are available
+        if (process.env.CLAUDE_API_KEY) {
+            this.anthropicClient = new Anthropic({
+                apiKey: config?.apiKey || process.env.CLAUDE_API_KEY
+            });
+        }
+        
+        if (process.env.OPENAI_API_KEY) {
+            this.openaiClient = new OpenAI({
+                apiKey: process.env.OPENAI_API_KEY
+            });
+        }
+
+        // Initialize services
         this.outputChannel = config?.outputChannel || vscode.window.createOutputChannel('CodeMonkey');
         this.workspaceService = new WorkspaceService(this.outputChannel);
         this.cacheService = CacheService.getInstance();
         this.modelService = ModelService.getInstance();
     }
 
-    private async prepareContext(history: Message[]): Promise<Message[]> {
-        if (!history || history.length === 0) {
-            return [];
-        }
-
-        return history;
-    }
-
     private async getWorkspaceContext(): Promise<string> {
         try {
             const workspaceInfo = await this.workspaceService.getWorkspaceContent(true);
-            if (!workspaceInfo) {
-                return 'No workspace context available.';
-            }
-
-            const context = `Current workspace: ${workspaceInfo.path}\n`;
-            return context;
+            return workspaceInfo ? 
+                `Current workspace: ${workspaceInfo.path}\n` : 
+                'No workspace context available.';
         } catch (error) {
             logger.error('Failed to get workspace context:', error);
             return 'Failed to get workspace context.';
         }
     }
 
-    private convertToAnthropicMessages(messages: Message[]): { role: Role; content: string }[] {
-        return messages
-            .filter(msg => msg.role !== 'system')
-            .map(msg => ({
-                role: msg.role as Role,
-                content: msg.content
-            }));
-    }
-
     async sendMessage(message: string, history: Message[] = []): Promise<string> {
         try {
-            logger.info('Preparing context for Claude API');
-            
             if (!message) {
                 throw new Error('Message cannot be empty');
             }
+
+            // Get workspace context and prepare message
+            const workspaceContext = await this.getWorkspaceContext();
+            const contextualizedMessage = `${workspaceContext}\n\nUser Message: ${message}`;
             
-            // Try to find similar cached responses
+            // Check cache for similar responses
             const similarResponses = await this.cacheService.search(
                 message,
-                2,  // Use level 2 for responses
+                2,
                 ['chat_response'],
                 0.9
             );
@@ -96,49 +93,87 @@ export class ClaudeService {
                 logger.info('Found cached similar response');
                 return similarResponses[0].entry.content;
             }
-            
-            const workspaceContext = await this.getWorkspaceContext();
-            const optimizedHistory = await this.prepareContext(history);
-            const contextualizedMessage = `${workspaceContext}\n\nUser Message: ${message}`;
-            
-            const response = await this.client.messages.create({
-                model: this.modelService.getModelString(),
-                max_tokens: 4000,
-                messages: [
-                    ...this.convertToAnthropicMessages(optimizedHistory),
-                    { role: 'user' as Role, content: contextualizedMessage }
-                ],
-                system: SYSTEM_PROMPT
-            });
 
-            if (!response?.content?.[0]?.text) {
-                throw new Error('Invalid response from Claude API');
+            // Get current model and send message
+            const currentModel = this.modelService.getCurrentModel();
+            let responseContent = '';
+
+            if (currentModel.startsWith('gpt')) {
+                responseContent = await this.sendOpenAIMessage(contextualizedMessage, history);
+            } else {
+                responseContent = await this.sendClaudeMessage(contextualizedMessage, history);
+            }
+
+            if (!responseContent) {
+                throw new Error('Invalid response from model API');
             }
 
             // Cache the response
             await this.cacheService.store(
-                2,  // Use level 2 for responses
-                response.content[0].text,
+                2,
+                responseContent,
                 ['chat_response', 'workspace_context'],
-                undefined,  // No parent ID
-                response.usage?.output_tokens
+                undefined,
+                4000
             );
 
-            logger.info(`Used model: ${this.modelService.getCurrentModel()}`);
-            return response.content[0].text;
+            return responseContent;
 
         } catch (error) {
-            logger.error('Error calling Claude API:', error);
+            logger.error('Error calling model API:', error);
             throw error;
         }
     }
 
-    public dispose(): void {
-        this.outputChannel.dispose();
+    private async sendOpenAIMessage(message: string, history: Message[]): Promise<string> {
+        if (!this.openaiClient) {
+            throw new Error('OpenAI client is not configured properly.');
+        }
+
+        const response = await this.openaiClient.chat.completions.create({
+            model: MODELS[this.modelService.getCurrentModel()].modelString,
+            messages: [
+                { role: 'system', content: SYSTEM_PROMPT },
+                ...history.map(msg => ({
+                    role: msg.role,
+                    content: msg.content
+                })),
+                { role: 'user', content: message }
+            ],
+            max_tokens: 4000
+        });
+
+        return response.choices[0]?.message?.content || '';
+    }
+
+    private async sendClaudeMessage(message: string, history: Message[]): Promise<string> {
+        if (!this.anthropicClient) {
+            throw new Error('Claude client is not configured properly.');
+        }
+
+        const response = await this.anthropicClient.messages.create({
+            model: MODELS[this.modelService.getCurrentModel()].modelString,
+            max_tokens: 4000,
+            messages: history.map(msg => ({
+                role: msg.role === 'user' ? 'user' : 'assistant',
+                content: msg.content
+            })),
+            system: SYSTEM_PROMPT
+        });
+
+        return response.content[0].text;
     }
 
     public setModel(modelId: string): void {
+        if (!MODELS[modelId as ModelType]) {
+            throw new Error(`Model ${modelId} is not recognized. Please select a valid model.`);
+        }
+        logger.info(`Setting model to: ${modelId}`);
         this.modelService.setModel(modelId as ModelType);
+    }
+
+    public dispose(): void {
+        this.outputChannel.dispose();
     }
 }
 

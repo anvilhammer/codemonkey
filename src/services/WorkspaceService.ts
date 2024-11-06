@@ -1,14 +1,21 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs/promises';
 import * as path from 'path';
+import { spawn } from 'child_process';
 import { logger } from '../utils/logger';
-import { CommandResult } from '../vscode/commands/commands';
 
 export interface WorkspaceInfo {
     path: string;
     files: string[];
     directories: string[];
     fileContents?: { [path: string]: string };
+}
+
+export interface CommandResult {
+    success: boolean;
+    output: string;
+    error?: string;
+    workspaceChanges?: WorkspaceInfo;
 }
 
 interface FileOperationTransaction {
@@ -28,6 +35,71 @@ export class WorkspaceService {
         this.outputChannel = outputChannel || vscode.window.createOutputChannel('CodeMonkey Shell');
     }
 
+    async executeCommand(command: string): Promise<CommandResult> {
+        return new Promise((resolve) => {
+            this.outputChannel.show(true);
+            this.outputChannel.appendLine(`\n\x1b[36m> Executing: ${command}\x1b[0m`);
+
+            let outputBuffer = '';
+            let errorBuffer = '';
+
+            const process = spawn(command, [], {
+                shell: true,
+                cwd: this.resolveWorkspacePath('.')
+            });
+
+            process.stdout.on('data', (data) => {
+                const output = data.toString();
+                outputBuffer += output;
+                this.outputChannel.append(`\x1b[32m${output}\x1b[0m`);
+                logger.info(`Command output: ${output.trim()}`);
+            });
+
+            process.stderr.on('data', (data) => {
+                const error = data.toString();
+                errorBuffer += error;
+                this.outputChannel.append(`\x1b[31m${error}\x1b[0m`);
+                logger.error(`Command error: ${error.trim()}`);
+            });
+
+            process.on('close', async (code) => {
+                const workspaceChanges = await this.getWorkspaceContent();
+                const result: CommandResult = {
+                    success: code === 0,
+                    output: outputBuffer,
+                    workspaceChanges,
+                    ...(code !== 0 && { error: errorBuffer })
+                };
+
+                if (code !== 0) {
+                    this.outputChannel.appendLine(`\x1b[31m✖ Command failed with exit code ${code}\x1b[0m`);
+                } else {
+                    this.outputChannel.appendLine(`\x1b[32m✔ Command completed successfully\x1b[0m`);
+                }
+
+                if (workspaceChanges) {
+                    this.outputChannel.appendLine('\n\x1b[36mWorkspace changes:\x1b[0m');
+                    this.outputChannel.appendLine(`Files: ${workspaceChanges.files.join(', ')}`);
+                    this.outputChannel.appendLine(`Directories: ${workspaceChanges.directories.join(', ')}`);
+                }
+
+                resolve(result);
+            });
+
+            process.on('error', (error) => {
+                const result: CommandResult = {
+                    success: false,
+                    output: outputBuffer,
+                    error: error.message
+                };
+                this.outputChannel.appendLine(`\x1b[31m✖ Failed to execute command: ${error.message}\x1b[0m`);
+                logger.error('Command execution error:', error);
+                resolve(result);
+            });
+        });
+    }
+
+    // Transaction Management
     async createWorkspaceSnapshot(): Promise<void> {
         this.cachedWorkspaceInfo = await this.getWorkspaceContent(true);
     }
@@ -70,19 +142,27 @@ export class WorkspaceService {
 
     async rollbackTransaction(transaction: FileOperationTransaction): Promise<void> {
         for (const operation of transaction.operations.reverse()) {
-            switch (operation.type) {
-                case 'CREATE_FILE':
-                case 'UPDATE_FILE':
-                    await this.deleteFile(operation.filePath);
-                    break;
-                case 'DELETE_FILE':
-                    await this.createFile(operation.filePath, transaction.workspaceInfo.fileContents?.[operation.filePath] || '');
-                    break;
+            try {
+                switch (operation.type) {
+                    case 'CREATE_FILE':
+                    case 'UPDATE_FILE':
+                        await this.deleteFile(operation.filePath);
+                        break;
+                    case 'DELETE_FILE':
+                        await this.createFile(
+                            operation.filePath, 
+                            transaction.workspaceInfo.fileContents?.[operation.filePath] || ''
+                        );
+                        break;
+                }
+            } catch (error) {
+                logger.error(`Rollback failed for operation ${operation.type}:`, error);
             }
         }
         this.cachedWorkspaceInfo = transaction.workspaceInfo;
     }
 
+    // File Operations
     async createFile(filePath: string, content: string): Promise<void> {
         try {
             const fullPath = this.resolveWorkspacePath(filePath);
@@ -93,6 +173,18 @@ export class WorkspaceService {
         } catch (error) {
             this.outputChannel.appendLine(`\x1b[31m✖ Failed to create file ${filePath}: ${error}\x1b[0m`);
             logger.error(`Failed to create file ${filePath}:`, error);
+            throw error;
+        }
+    }
+
+    async readFile(filePath: string): Promise<string> {
+        try {
+            const fullPath = this.resolveWorkspacePath(filePath);
+            const content = await fs.readFile(fullPath, 'utf-8');
+            logger.info(`Read file: ${filePath}`);
+            return content;
+        } catch (error) {
+            logger.error(`Failed to read file ${filePath}:`, error);
             throw error;
         }
     }
@@ -123,6 +215,7 @@ export class WorkspaceService {
         }
     }
 
+    // Workspace Operations
     async getWorkspaceContent(includeFileContents = false): Promise<WorkspaceInfo> {
         const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
         if (!workspaceFolder) {
@@ -140,7 +233,6 @@ export class WorkspaceService {
                 const fullPath = path.join(dir, entry.name);
                 const relativePath = path.relative(rootPath, fullPath);
 
-                // Skip node_modules and .git
                 if (entry.name === 'node_modules' || entry.name === '.git') {
                     continue;
                 }
@@ -177,42 +269,5 @@ export class WorkspaceService {
             throw new Error('No workspace folder is currently open');
         }
         return path.join(workspaceFolder.uri.fsPath, relativePath);
-    }
-
-    public async readFile(filePath: string): Promise<string> {
-        try {
-            const fullPath = this.resolveWorkspacePath(filePath);
-            const content = await fs.readFile(fullPath, 'utf-8');
-            this.outputChannel.appendLine(`Read file: ${filePath}`);
-            logger.info(`Read file: ${filePath}`);
-            return content;
-        } catch (error) {
-            logger.error(`Failed to read file ${filePath}:`, error);
-            throw error;
-        }
-    }
-
-    public async executeCommand(command: string): Promise<CommandResult> {
-        return new Promise((resolve) => {
-            const terminal = vscode.window.createTerminal('CodeMonkey Terminal');
-            this.outputChannel.appendLine(`Executing command: ${command}`);
-            
-            terminal.sendText(command);
-            
-            setTimeout(async () => {
-                try {
-                    terminal.dispose();
-                    const workspaceInfo = await this.getWorkspaceContent();
-                    resolve({
-                        output: `Command executed: ${command}\nCurrent workspace state:\nFiles: ${workspaceInfo.files.join(', ')}\nDirectories: ${workspaceInfo.directories.join(', ')}`
-                    });
-                } catch (error) {
-                    resolve({
-                        output: `Command executed: ${command}`,
-                        error: error instanceof Error ? error.message : String(error)
-                    });
-                }
-            }, 2000);
-        });
     }
 }

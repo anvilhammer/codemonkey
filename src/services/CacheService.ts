@@ -43,10 +43,11 @@ export class CacheService {
 
     static getInstance(): CacheService {
         if (!CacheService.instance) {
-            CacheService.instance = CacheService.getInstance();
+            CacheService.instance = new CacheService(); 
         }
         return CacheService.instance;
     }
+    
 
     private async initializeCache(): Promise<void> {
         try {

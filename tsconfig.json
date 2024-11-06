@@ -6,19 +6,25 @@
         "sourceMap": true,
         "rootDir": "src",
         "strict": true,
+        "strictNullChecks": true,  // Ensures better type checking for null values
         "moduleResolution": "node",
         "baseUrl": "./",
         "esModuleInterop": true,
+        "allowSyntheticDefaultImports": true, // Allows easier import of CommonJS modules
+        "resolveJsonModule": true, // Enables importing JSON files
         "skipLibCheck": true,
         "forceConsistentCasingInFileNames": true,
-        "outDir": "dist",
+        "outDir": "out",
         "typeRoots": [
             "./node_modules/@types"
         ],
         "types": [
             "node",
             "pg"
-        ]
+        ],
+        "paths": {
+            "@types/*": ["src/types/*"]
+        }
     },
     "include": [
         "src/**/*"

@@ -1,6 +1,6 @@
-// src/services/ModelService.ts
+// Path: src/services/ModelService.ts
 
-export type ModelType = 'haiku' | 'sonnet' | 'opus';
+export type ModelType = 'haiku' | 'gpt3_5' | 'omini' | 'sonnet' | 'opus' | 'gpt4o';
 
 export interface Model {
     id: ModelType;
@@ -22,6 +22,24 @@ export const MODELS: Record<ModelType, Model> = {
         contextTokenLimit: 128000,
         outputTokenLimit: 4096
     },
+    gpt3_5: {
+        id: 'gpt3_5',
+        name: 'GPT-3.5 Turbo',
+        description: 'Affordable, well-rounded model',
+        modelString: 'gpt-3.5-turbo',
+        cost: 0.0004,
+        contextTokenLimit: 4096,
+        outputTokenLimit: 4096
+    },
+    omini: {
+        id: 'omini',
+        name: 'OpenAI Mini',
+        description: 'Cost-effective, lightweight model',
+        modelString: 'openai-mini',
+        cost: 0.0008,
+        contextTokenLimit: 60000,
+        outputTokenLimit: 2048
+    },
     sonnet: {
         id: 'sonnet',
         name: 'Claude 3 Sonnet',
@@ -39,12 +57,21 @@ export const MODELS: Record<ModelType, Model> = {
         cost: 0.015,
         contextTokenLimit: 200000,
         outputTokenLimit: 4096
+    },
+    gpt4o: {
+        id: 'gpt4o',
+        name: 'GPT-4 Optimized',
+        description: 'OpenAI\'s GPT-4 with optimized performance',
+        modelString: 'gpt-4-optimized',
+        cost: 0.03,
+        contextTokenLimit: 150000,
+        outputTokenLimit: 4096
     }
 };
 
 export class ModelService {
     private static instance: ModelService;
-    private currentModel: ModelType = 'haiku';
+    private currentModel: ModelType = 'gpt3_5';
 
     private constructor() {}
 

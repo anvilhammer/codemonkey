@@ -50,7 +50,7 @@
   "devDependencies": {
     "@types/glob": "^8.1.0",
     "@types/mocha": "^10.0.6",
-    "@types/node": "18.x",
+    "@types/node": "^18.19.64",
     "@types/pg": "^8.11.10",
     "@types/vscode": "^1.85.0",
     "@types/winston": "^2.4.4",
@@ -64,6 +64,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.18.0",
     "dotenv": "^16.4.5",
+    "openai": "^4.71.0",
     "pg": "^8.13.1",
     "winston": "^3.11.0"
   }
