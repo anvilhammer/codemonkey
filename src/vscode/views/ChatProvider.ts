@@ -9,6 +9,7 @@ import { WorkspaceService } from '../../services/WorkspaceService';
 import { ModelService, ModelType, MODELS } from '../../services/ModelService';
 import { CommandParser } from '../../services/CommandParser';
 import { getHtmlForWebview } from '../../webview/webviewTemplate';
+import { WorkspaceHandler } from '../../services/WorkspaceHandler';
 
 export class ChatProvider implements vscode.WebviewViewProvider {
     private _view?: vscode.WebviewView;
@@ -285,35 +286,7 @@ export class ChatProvider implements vscode.WebviewViewProvider {
 
     // Get detailed information about the current workspace
     private async getWorkspaceInfo(): Promise<string> {
-        try {
-            const workspaceContent = await this.workspaceService.getWorkspaceContent(true);
-            if (!workspaceContent) {
-                return 'No workspace context available.';
-            }
-
-            const info: string[] = [`Current workspace: ${workspaceContent.path}`];
-            
-            if (workspaceContent.directories.length > 0) {
-                info.push('\nDirectories:');
-                workspaceContent.directories.forEach(dir => info.push(`  ${dir}`));
-            }
-
-            if (workspaceContent.files.length > 0) {
-                info.push('\nFiles:');
-                workspaceContent.files.forEach(file => {
-                    info.push(`  ${file}`);
-                    const content = workspaceContent.fileContents?.[file];
-                    if (content && content.length < 500) {
-                        info.push(`    Content:\n${content.split('\n').map(line => `      ${line}`).join('\n')}`);
-                    }
-                });
-            }
-
-            return info.join('\n');
-        } catch (error) {
-            logger.error('Failed to get workspace info:', error);
-            return 'Unable to get workspace information';
-        }
+        return WorkspaceHandler.getWorkspaceInfo();
     }
 
     // Update the webview with new messages

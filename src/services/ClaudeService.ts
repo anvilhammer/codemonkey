@@ -1,5 +1,3 @@
-// src/services/ClaudeService.ts
-
 import Anthropic from '@anthropic-ai/sdk';
 import OpenAI from 'openai';
 import * as dotenv from 'dotenv';
@@ -7,10 +5,10 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { logger } from '../utils/logger';
 import { Message } from '../vscode/types/chat';
-import { SYSTEM_PROMPT } from './SystemPrompts';
 import { WorkspaceService } from './WorkspaceService';
 import { CacheService } from './CacheService';
 import { ModelService, ModelType, MODELS } from './ModelService';
+import { MessageService } from './MessageService';
 
 // Load environment variables
 const envPath = path.join(__dirname, '..', '..', '.env');
@@ -37,6 +35,7 @@ export class ClaudeService {
     private modelService: ModelService;
     private cacheService: CacheService;
     private readonly outputChannel: vscode.OutputChannel;
+    private messageService: MessageService;
 
     constructor(config?: ClaudeServiceConfig) {
         // Initialize clients if API keys are available
@@ -57,6 +56,7 @@ export class ClaudeService {
         this.workspaceService = new WorkspaceService(this.outputChannel);
         this.cacheService = CacheService.getInstance();
         this.modelService = ModelService.getInstance();
+        this.messageService = MessageService.getInstance();
     }
 
     private async getWorkspaceContext(): Promise<string> {
@@ -77,37 +77,49 @@ export class ClaudeService {
                 throw new Error('Message cannot be empty');
             }
 
-            // Get workspace context and prepare message
+            // Get current model first
+            const currentModel = this.modelService.getCurrentModel();
+
+            // Get workspace context and format messages
             const workspaceContext = await this.getWorkspaceContext();
-            const contextualizedMessage = `${workspaceContext}\n\nUser Message: ${message}`;
-            
-            // Check cache for similar responses
-            const similarResponses = await this.cacheService.search(
+            const formattedMessages = await this.messageService.formatMessagesForModel(
                 message,
-                2,
-                ['chat_response'],
-                0.9
+                history,
+                workspaceContext
             );
 
-            if (similarResponses.length > 0) {
-                logger.info('Found cached similar response');
-                return similarResponses[0].entry.content;
-            }
+            let responseContent: string;
 
-            // Get current model and send message
-            const currentModel = this.modelService.getCurrentModel();
-            let responseContent = '';
-
-            if (currentModel.startsWith('gpt')) {
-                responseContent = await this.sendOpenAIMessage(contextualizedMessage, history);
+            if (!formattedMessages.isClaudeModel) {
+                if (!this.openaiClient) {
+                    throw new Error('OpenAI client is not configured.');
+                }
+                const response = await this.openaiClient.chat.completions.create({
+                    model: MODELS[currentModel].modelString,
+                    messages: formattedMessages.messages,
+                    max_tokens: MODELS[currentModel].outputTokenLimit
+                });
+                responseContent = response.choices[0]?.message?.content || '';
             } else {
-                responseContent = await this.sendClaudeMessage(contextualizedMessage, history);
-            }
+                if (!this.anthropicClient) {
+                    throw new Error('Claude client is not configured.');
+                }
+                
+                // Safely cast messages for Anthropic API
+                const anthropicMessages = formattedMessages.messages as Array<{
+                    role: 'user' | 'assistant';
+                    content: string;
+                }>;
 
-            if (!responseContent) {
-                throw new Error('Invalid response from model API');
+                const response = await this.anthropicClient.messages.create({
+                    model: MODELS[currentModel].modelString,
+                    messages: anthropicMessages,
+                    system: formattedMessages.system,
+                    max_tokens: MODELS[currentModel].outputTokenLimit
+                });
+                responseContent = response.content[0].text;
             }
-
+            
             // Cache the response
             await this.cacheService.store(
                 2,
@@ -123,45 +135,6 @@ export class ClaudeService {
             logger.error('Error calling model API:', error);
             throw error;
         }
-    }
-
-    private async sendOpenAIMessage(message: string, history: Message[]): Promise<string> {
-        if (!this.openaiClient) {
-            throw new Error('OpenAI client is not configured properly.');
-        }
-
-        const response = await this.openaiClient.chat.completions.create({
-            model: MODELS[this.modelService.getCurrentModel()].modelString,
-            messages: [
-                { role: 'system', content: SYSTEM_PROMPT },
-                ...history.map(msg => ({
-                    role: msg.role,
-                    content: msg.content
-                })),
-                { role: 'user', content: message }
-            ],
-            max_tokens: 4000
-        });
-
-        return response.choices[0]?.message?.content || '';
-    }
-
-    private async sendClaudeMessage(message: string, history: Message[]): Promise<string> {
-        if (!this.anthropicClient) {
-            throw new Error('Claude client is not configured properly.');
-        }
-
-        const response = await this.anthropicClient.messages.create({
-            model: MODELS[this.modelService.getCurrentModel()].modelString,
-            max_tokens: 4000,
-            messages: history.map(msg => ({
-                role: msg.role === 'user' ? 'user' : 'assistant',
-                content: msg.content
-            })),
-            system: SYSTEM_PROMPT
-        });
-
-        return response.content[0].text;
     }
 
     public setModel(modelId: string): void {

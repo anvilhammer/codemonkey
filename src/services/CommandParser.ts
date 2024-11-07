@@ -1,94 +1,128 @@
-import { Command, CommandType } from '../types/commands';
+import * as vscode from 'vscode';
 import { logger } from '../utils/logger';
+
+export interface Command {
+    type: CommandType;
+    params: Record<string, string | number>;
+}
+
+export type CommandType = 
+    | 'CREATE_FILE'
+    | 'WRITE_TO_FILE'
+    | 'READ_FILE'
+    | 'DELETE_FILE'
+    | 'EXECUTE_COMMAND'
+    | 'INSTALL_PACKAGE'
+    | 'CREATE_DIRECTORY'
+    | 'SET_ENV_VAR';
 
 export class CommandParser {
     static parse(text: string): Command[] {
         const commands: Command[] = [];
         
-        // Look for JSON command objects in the text
-        const regex = /\{[\s\S]*?\}/g;
-        const matches = text.match(regex);
+        // Parse <systemCommand> tags
+        const systemCommandRegex = /<systemCommand>([\s\S]*?)<\/systemCommand>/g;
+        let match;
         
-        if (!matches) {
-            return commands;
-        }
-
-        for (const match of matches) {
-            try {
-                const command = JSON.parse(match);
-                if (this.isValidCommand(command)) {
-                    if (this.validateCommandParams(command)) {
-                        commands.push(command);
-                    } else {
-                        logger.warn(`Invalid command parameters: ${JSON.stringify(command)}`);
+        while ((match = systemCommandRegex.exec(text)) !== null) {
+            const commandText = match[1].trim();
+            
+            // Parse npm/yarn commands
+            if (commandText.startsWith('npm ') || commandText.startsWith('yarn ')) {
+                commands.push({
+                    type: 'INSTALL_PACKAGE',
+                    params: {
+                        command: commandText
                     }
-                }
-            } catch (error) {
-                // If it's not valid JSON, just skip it
+                });
                 continue;
             }
+
+            // Parse mkdir commands
+            if (commandText.startsWith('mkdir ')) {
+                commands.push({
+                    type: 'CREATE_DIRECTORY',
+                    params: {
+                        path: commandText.replace('mkdir ', '').trim()
+                    }
+                });
+                continue;
+            }
+
+            // Handle other commands
+            commands.push({
+                type: 'EXECUTE_COMMAND',
+                params: {
+                    command: commandText
+                }
+            });
         }
 
+        // Parse file operations using standard format
+        const fileOpRegex = /(CREATE_FILE|WRITE_TO_FILE|READ_FILE|DELETE_FILE):\s*([^\n]+)(?:\n([\s\S]*?)(?=\n(?:CREATE_FILE|WRITE_TO_FILE|READ_FILE|DELETE_FILE):|$))?/g;
+        
+        while ((match = fileOpRegex.exec(text)) !== null) {
+            const [, type, path, content] = match;
+            
+            commands.push({
+                type: type as CommandType,
+                params: {
+                    path: path.trim(),
+                    ...(content && { content: content.trim() })
+                }
+            });
+        }
+
+        // Log parsed commands for debugging
+        logger.info('Parsed commands:', commands);
+        
         return commands;
     }
 
-    private static isValidCommand(command: unknown): command is Command {
-        if (typeof command !== 'object' || command === null) {
-            return false;
-        }
+    static async executeCommand(command: Command): Promise<void> {
+        try {
+            switch (command.type) {
+                case 'CREATE_FILE':
+                case 'WRITE_TO_FILE': {
+                    const uri = vscode.Uri.file(command.params.path as string);
+                    const content = command.params.content as string || '';
+                    await vscode.workspace.fs.writeFile(uri, Buffer.from(content));
+                    break;
+                }
 
-        const validTypes: CommandType[] = [
-            'CREATE_FILE',
-            'WRITE_TO_FILE',
-            'READ_FILE',
-            'DELETE_FILE',
-            'EXECUTE_COMMAND'
-        ];
+                case 'READ_FILE': {
+                    const uri = vscode.Uri.file(command.params.path as string);
+                    await vscode.workspace.fs.readFile(uri);
+                    break;
+                }
 
-        return (
-            'type' in command &&
-            'params' in command &&
-            typeof (command as Command).type === 'string' &&
-            validTypes.includes((command as Command).type as CommandType)
-        );
-    }
+                case 'DELETE_FILE': {
+                    const uri = vscode.Uri.file(command.params.path as string);
+                    await vscode.workspace.fs.delete(uri);
+                    break;
+                }
 
-    private static validateCommandParams(command: Command): boolean {
-        const validPathPattern = /^[a-zA-Z0-9_\-./\\]+$/;
+                case 'CREATE_DIRECTORY': {
+                    const uri = vscode.Uri.file(command.params.path as string);
+                    await vscode.workspace.fs.createDirectory(uri);
+                    break;
+                }
 
-        switch (command.type) {
-            case 'CREATE_FILE':
-            case 'WRITE_TO_FILE': {
-                const { path, content } = command.params;
-                return (
-                    typeof path === 'string' &&
-                    typeof content === 'string' &&
-                    validPathPattern.test(path) &&
-                    !path.includes('..') &&
-                    !path.startsWith('/') &&
-                    !path.startsWith('\\')
-                );
+                case 'INSTALL_PACKAGE': {
+                    const terminal = vscode.window.createTerminal('Package Installation');
+                    terminal.sendText(command.params.command as string);
+                    terminal.show();
+                    break;
+                }
+
+                case 'EXECUTE_COMMAND': {
+                    await vscode.commands.executeCommand(command.params.command as string);
+                    break;
+                }
             }
-            
-            case 'READ_FILE':
-            case 'DELETE_FILE': {
-                const { path } = command.params;
-                return (
-                    typeof path === 'string' &&
-                    validPathPattern.test(path) &&
-                    !path.includes('..') &&
-                    !path.startsWith('/') &&
-                    !path.startsWith('\\')
-                );
-            }
-
-            case 'EXECUTE_COMMAND': {
-                const { command: cmd } = command.params;
-                return typeof cmd === 'string' && cmd.length > 0;
-            }
-
-            default:
-                return false;
+        } catch (error) {
+            logger.error(`Failed to execute command ${command.type}:`, error);
+            throw error;
         }
     }
 }
